@@ -6,6 +6,7 @@ import { checkMoveArgs } from "./check_move_args.ts";
 
 export * from "./sync/mod.ts";
 export { SharedJsonBuffer } from "./json_buffer.ts";
+export type { JoinHandle, Result, SharedMemoryView } from "./types.ts";
 
 let globalPool: WorkerPool | null = null;
 let globalConfig = { maxWorkers: navigator.hardwareConcurrency || 4 };
