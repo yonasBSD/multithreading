@@ -146,7 +146,7 @@ A `Mutex` ensures that only one thread can access a specific piece of data at a 
 
 #### Option A: Automatic Management (Recommended)
 
-This library has support for the [Explicit Resource Management](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Statements/using) proposal (`using` keyword). When you acquire a lock, it returns a guard. When that guard goes out of scope, the lock is automatically released.
+This library implements the [Explicit Resource Management](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Statements/using) proposal (`using` keyword). When you acquire a lock, it returns a guard. When that guard goes out of scope, the lock is automatically released.
 
 ```typescript
 import { spawn, move, Mutex } from "multithreading";
