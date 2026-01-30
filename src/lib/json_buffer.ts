@@ -71,6 +71,25 @@ function initConsoleHooks() {
   }
 }
 
+function countUtf8Bytes(str: string): number {
+  let byteLen = 0;
+  const len = str.length;
+  for (let i = 0; i < len; i++) {
+    const code = str.charCodeAt(i);
+    if (code < 0x80) {
+      byteLen += 1;
+    } else if (code < 0x800) {
+      byteLen += 2;
+    } else if (code < 0xd800 || code >= 0xe000) {
+      byteLen += 3;
+    } else {
+      i++; // Surrogate pair, skip next unit
+      byteLen += 4;
+    }
+  }
+  return byteLen;
+}
+
 class SharedJsonBufferImpl<T extends Proxyable> extends Serializable {
   static {
     initConsoleHooks();
@@ -93,6 +112,9 @@ class SharedJsonBufferImpl<T extends Proxyable> extends Serializable {
 
   // GC State
   private activeTargets = new Set<Pointer>();
+  private registry = new FinalizationRegistry<Pointer>((target) => {
+    this.activeTargets.delete(target);
+  });
   private tempRoots: StackRoot[] = [];
 
   // Instance Scratch Variables
@@ -370,18 +392,60 @@ class SharedJsonBufferImpl<T extends Proxyable> extends Serializable {
     const len = this.u32[ptr >> 2]!;
     const offset = ptr + 4;
 
-    // Optimization: Short strings usually fit in stack/args limit
-    // and pure JS loop is often faster than TextDecoder overhead for < 20 chars
+    // Optimization: SWAR (SIMD Within A Register) for short strings.
+    // TextDecoder has high overhead for short strings (< ~64 chars).
+    // Manual decoding is faster, provided we can process 4 bytes at a time.
     if (len < 64) {
       let res = "";
-      for (let i = 0; i < len; i++) {
-        res += String.fromCharCode(this.u8[offset + i]!);
+      let i = 0;
+
+      // We can safely read u32 from 'offset' because 'ptr' is 8-byte aligned,
+      // making 'offset' (ptr + 4) always 4-byte aligned.
+      const u32Index = offset >> 2;
+      const loopLimit = len - 3; // Ensure we have a full 4-byte chunk
+
+      for (; i < loopLimit; i += 4) {
+        const chunk = this.u32[u32Index + (i >> 2)]!;
+
+        // Magic Mask: 0x80808080
+        // Checks bit 7 of all 4 bytes simultaneously.
+        // If ANY bit is set, it's UTF-8 (multibyte), so we bail to TextDecoder.
+        if ((chunk & 0x80808080) !== 0) {
+          i = -1; // Flag as failed
+          break;
+        }
+
+        // Fast Decode: We verified all 4 bytes are ASCII.
+        // Unpack Little-Endian u32 into characters.
+        res += String.fromCharCode(
+          chunk & 0xff,
+          (chunk >> 8) & 0xff,
+          (chunk >> 16) & 0xff,
+          chunk >>> 24,
+        );
       }
-      this.stringCache.set(ptr, res);
-      return res;
+
+      // Handle trailing bytes (0 to 3 bytes remainder) or check failure
+      if (i !== -1) {
+        for (; i < len; i++) {
+          const code = this.u8[offset + i]!;
+          if (code & 0x80) {
+            i = -1;
+            break;
+          }
+          res += String.fromCharCode(code);
+        }
+      }
+
+      // If i != -1, we successfully decoded everything as ASCII
+      if (i !== -1) {
+        this.stringCache.set(ptr, res);
+        return res;
+      }
+      // If we flagged -1, we hit a UTF-8 char. Fall through to TextDecoder.
     }
 
-    // Fallback for long strings or special chars
+    // Fallback: Long strings OR Strings containing Multi-byte chars
     const str = this.textDecoder.decode(
       this.u8.subarray(offset, offset + len),
     );
@@ -427,13 +491,41 @@ class SharedJsonBufferImpl<T extends Proxyable> extends Serializable {
     if (value === false) return { type: TYPE_FALSE, payload: 0 };
 
     if (typeof value === "string") {
-      const encoded = this.textEncoder.encode(value);
-      const len = encoded.byteLength;
-      const ptr = this.alloc(4 + len);
+      // Get current free pointer directly (bypass alloc() overhead for now)
+      const freePtrIdx = OFFSET_FREE_PTR >> 2;
+      let currentPtr = Atomics.load(this.u32, freePtrIdx);
 
-      this.u32[ptr >> 2] = len;
-      this.u8.set(encoded, ptr + 4);
-      return { type: TYPE_STRING, payload: ptr };
+      // Ensure alignment for the 4-byte length header
+      currentPtr = (currentPtr + 3) & ~3;
+
+      // Calculate worst-case size (3 bytes per char for UTF-8 + 4 bytes header)
+      const maxBytes = value.length * 3 + 4;
+
+      // Safety Check: If near end of buffer, fallback to standard alloc() (which handles GC and OOM errors properly)
+      if (currentPtr + maxBytes > this.buffer.byteLength) {
+        const encoded = this.textEncoder.encode(value); // Slow path allocation
+        const len = encoded.byteLength;
+        const ptr = this.alloc(4 + len);
+        this.u32[ptr >> 2] = len;
+        this.u8.set(encoded, ptr + 4);
+        return { type: TYPE_STRING, payload: ptr };
+      }
+
+      // Write directly to shared memory
+      const { written } = this.textEncoder.encodeInto(
+        value,
+        this.u8.subarray(currentPtr + 4, currentPtr + maxBytes),
+      );
+
+      // Write actual length
+      this.u32[currentPtr >> 2] = written!;
+
+      // Manually advance free pointer (Align to 8 bytes for future number writes)
+      const actualSize = 4 + written!;
+      const nextPtr = (currentPtr + actualSize + 7) & ~7;
+      Atomics.store(this.u32, freePtrIdx, nextPtr);
+
+      return { type: TYPE_STRING, payload: currentPtr };
     }
 
     if (Array.isArray(value)) {
@@ -510,7 +602,7 @@ class SharedJsonBufferImpl<T extends Proxyable> extends Serializable {
       const ptr = target.__ptr;
       if (ptr === 0) return undefined;
 
-      // Standard resolution
+      // Optimization: Inline Pointer Resolve (Avoids function call)
       const curr = ptr;
       const type = this.u32[curr >> 2]!;
       if (type !== TYPE_MOVED) {
@@ -522,24 +614,44 @@ class SharedJsonBufferImpl<T extends Proxyable> extends Serializable {
 
       const count = this.scratchLen;
       const start = this.scratchStart;
+      const propStr = String(prop);
 
-      // Check hint
-      const hint = this.propertyHints.get(String(prop));
+      // Check Hints (O(1) Access)
+      const hint = this.propertyHints.get(propStr);
       if (hint !== undefined && hint < count) {
         const entryOffset = start + hint * 12;
         const keyPtr = this.u32[entryOffset >> 2]!;
-        const keyStr = this.readString(keyPtr);
-        if (keyStr === prop) return this.readSlot(entryOffset + 4);
+
+        // Direct String Check (Optimized for "Happy Path")
+        // We assume the hint is correct, so we skip the byte-length math
+        // and just verify the string directly.
+        if (this.readString(keyPtr) === propStr) {
+          return this.readSlot(entryOffset + 4);
+        }
       }
 
-      // Scan
+      // Optimization: Pre-calculate UTF-8 Byte Length (O(K))
+      // This allows us to perform an integer check (O(1)) per entry
+      // instead of a string decode (O(K)) per entry.
+      const targetByteLen = countUtf8Bytes(propStr);
+
+      // Optimized Scan (O(N))
       for (let i = 0; i < count; i++) {
         const entryOffset = start + i * 12;
         const keyPtr = this.u32[entryOffset >> 2]!;
+
+        // Length check: Read the string byte-length header from memory
+        const storedLen = this.u32[keyPtr >> 2]!;
+
+        // Skip if lengths don't match.
+        // This avoids decoding/allocating strings for 99% of mismatches.
+        if (storedLen !== targetByteLen) continue;
+
+        // Full string check (only performed on length candidates)
         const key = this.readString(keyPtr);
 
-        if (key === prop) {
-          this.propertyHints.set(String(prop), i);
+        if (key === propStr) {
+          this.propertyHints.set(propStr, i);
           return this.readSlot(entryOffset + 4);
         }
       }
@@ -553,8 +665,18 @@ class SharedJsonBufferImpl<T extends Proxyable> extends Serializable {
       }
       if (prop === "__ptr" || prop === "toJSON") return true;
 
-      this.resolvePtr(target.__ptr);
-      if (target.__ptr === 0) return false;
+      const ptr = target.__ptr;
+      if (ptr === 0) return false;
+
+      // Optimization: Inline Pointer Resolve
+      const curr = ptr;
+      const type = this.u32[curr >> 2]!;
+      if (type !== TYPE_MOVED) {
+        this.scratchLen = this.u32[(curr + 8) >> 2]!;
+        this.scratchStart = curr + 12;
+      } else {
+        this.resolvePtr(ptr);
+      }
 
       const propStr = String(prop);
       const count = this.scratchLen;
@@ -565,17 +687,21 @@ class SharedJsonBufferImpl<T extends Proxyable> extends Serializable {
       if (hint !== undefined && hint < count) {
         const entryOffset = start + hint * 12;
         const keyPtr = this.u32[entryOffset >> 2]!;
-        const keyStr = this.readString(keyPtr);
-        if (keyStr === propStr) return true;
+        if (this.readString(keyPtr) === propStr) return true;
       }
+
+      // Optimization: Length Check
+      const targetByteLen = countUtf8Bytes(propStr);
 
       // Scan
       for (let i = 0; i < count; i++) {
         const entryOffset = start + i * 12;
         const keyPtr = this.u32[entryOffset >> 2]!;
-        const key = this.readString(keyPtr);
 
-        if (key === propStr) {
+        const storedLen = this.u32[keyPtr >> 2]!;
+        if (storedLen !== targetByteLen) continue;
+
+        if (this.readString(keyPtr) === propStr) {
           this.propertyHints.set(propStr, i);
           return true;
         }
@@ -657,10 +783,17 @@ class SharedJsonBufferImpl<T extends Proxyable> extends Serializable {
         }
       }
 
+      // Optimization: Length Check
+      const targetByteLen = countUtf8Bytes(propStr);
+
       // 3. Scan
       for (let i = 0; i < count; i++) {
         const entryOffset = start + i * 12;
         const keyPtr = this.u32[entryOffset >> 2]!;
+
+        const storedLen = this.u32[keyPtr >> 2]!;
+        if (storedLen !== targetByteLen) continue;
+
         const key = this.readString(keyPtr);
 
         if (key === propStr) {
@@ -709,6 +842,8 @@ class SharedJsonBufferImpl<T extends Proxyable> extends Serializable {
       target,
       type === TYPE_ARRAY ? this.arrayHandler : this.objectHandler,
     );
+
+    this.registry.register(proxy, target as Pointer);
 
     // Store as WeakRef
     this.proxyCache.set(resolvedPtr, new WeakRef(proxy));
@@ -1354,22 +1489,22 @@ class ArrayCursor implements IterableIterator<any> {
   private index = 0;
   private len: number;
   private start: number;
-  private flyweightProxy: any;
-  private target = { __ptr: 0 };
-  private result: IteratorResult<any>;
+
+  // Optimization 1: Cache views locally to avoid 'this.buffer' lookups in the hot loop
+  private u32: Uint32Array;
+  private f64: Float64Array;
 
   constructor(private buffer: SharedJsonBufferImpl<any>, ptr: number) {
     buffer.resolvePtr(ptr);
     this.len = buffer.scratchLen;
     this.start = buffer.scratchStart;
+    this.u32 = buffer.u32;
+    this.f64 = buffer.f64;
 
-    const type = buffer.u32[buffer.scratchPtr >> 2]!;
-    if (type !== TYPE_ARRAY) {
+    // Direct check: Type Array is 6
+    if (this.u32[buffer.scratchPtr >> 2] !== 6) {
       throw new Error("Iterator must be used on an Array");
     }
-
-    this.flyweightProxy = new Proxy(this.target, buffer.objectHandler);
-    this.result = { done: false, value: this.flyweightProxy };
   }
 
   [Symbol.iterator]() {
@@ -1377,25 +1512,37 @@ class ArrayCursor implements IterableIterator<any> {
   }
 
   next(): IteratorResult<any> {
+    // Bounds check
     if (this.index >= this.len) {
-      this.result.done = true;
-      this.result.value = undefined;
-      return this.result;
+      return { done: true, value: undefined };
     }
 
-    const offset = this.start + this.index * 8;
-    const itemType = this.buffer.u32[offset >> 2]!;
-    const itemPayload = this.buffer.u32[(offset + 4) >> 2]!;
+    // Optimization 2: Bitwise shift for *8.
+    // Calculate offset: start + (index * 8)
+    const offset = this.start + (this.index++ << 3);
 
-    this.index++;
+    // Direct memory read
+    const type = this.u32[offset >> 2]!;
 
-    if (itemType === TYPE_OBJECT || itemType === TYPE_ARRAY) {
-      this.target.__ptr = itemPayload;
-      return this.result;
+    // Optimization 3: Inline Primitive Handling (Zero Allocation Path)
+    // TYPE_NUMBER (3) is the most common primitive, check it first.
+    if (type === 3) {
+      const payload = this.u32[(offset + 4) >> 2]!;
+      return { done: false, value: this.f64[payload >> 3] };
     }
 
-    this.result.value = this.buffer.readSlot(offset);
-    return this.result;
+    // TYPE_NULL (0), TYPE_TRUE (1), TYPE_FALSE (2)
+    if (type <= 2) {
+      // Nested ternary is faster than switch for 3 values
+      const val = type === 1 ? true : (type === 2 ? false : null);
+      return { done: false, value: val };
+    }
+
+    // Fallback: Objects (5, 6) & Strings (4)
+    // We MUST delegate to readSlot here to get the correct Proxy or String.
+    // This maintains correctness (distinct objects) while isolating the cost
+    // only to complex types.
+    return { done: false, value: this.buffer.readSlot(offset) };
   }
 }
 

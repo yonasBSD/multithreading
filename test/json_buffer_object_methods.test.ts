@@ -1,15 +1,5 @@
-import {
-  assert,
-  assertEquals,
-  assertExists,
-  assertNotEquals,
-} from "@std/assert";
+import { assert, assertEquals, assertExists } from "@std/assert";
 import { SharedJsonBuffer } from "../src/deno/lib.ts";
-
-// --------------------------------------------------------------------------
-// 1. Basic CRUD (Create, Read, Update, Delete)
-// These are the core Proxy traps for getting, setting, and deleting properties.
-// --------------------------------------------------------------------------
 
 Deno.test("Object CRUD: Property Access and Assignment", () => {
   const db = new SharedJsonBuffer<{ name: string; age: number; city?: string }>(
@@ -49,7 +39,7 @@ Deno.test("Object CRUD: Deletion and Existence", () => {
   assertEquals("z" in db, false);
 
   // Delete operator
-  // @ts-ignore
+  // @ts-ignore test
   const deleteResult = delete db.b;
   assertEquals(deleteResult, true); // delete returns true if successful
 
@@ -105,11 +95,6 @@ Deno.test("Object Iteration: for...in loop", () => {
   assertEquals(keysFound.length, 2);
 });
 
-// --------------------------------------------------------------------------
-// 3. Merging, Copying, and Spread Syntax
-// These rely on keys and getters working correctly in tandem.
-// --------------------------------------------------------------------------
-
 Deno.test("Object Copying: Object.assign", () => {
   const db = new SharedJsonBuffer<{ a: number; b: number }>({ a: 1, b: 2 });
 
@@ -153,11 +138,6 @@ Deno.test("Object Transformation: Object.fromEntries", () => {
   assertEquals(reconstructed["status"], "active");
 });
 
-// --------------------------------------------------------------------------
-// 4. Property Descriptors & Definition
-// Advanced tests for defineProperty and getOwnPropertyDescriptor.
-// --------------------------------------------------------------------------
-
 Deno.test("Object Descriptors: getOwnPropertyDescriptor", () => {
   const db = new SharedJsonBuffer({ id: 100 });
 
@@ -195,10 +175,6 @@ Deno.test("Object Comparison: Object.is", () => {
   // Object.is handles NaN correctly
   assert(Object.is(db.val, NaN));
 });
-
-// --------------------------------------------------------------------------
-// 5. Nested Objects & Modern Accessors
-// --------------------------------------------------------------------------
 
 Deno.test("Object Nested: Deep Access and Mutation", () => {
   const db = new SharedJsonBuffer<{
